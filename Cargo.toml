@@ -1,0 +1,9 @@
+[package]
+name = "openboatutils"
+version = "0.1.1"
+edition = "2024"
+
+[dependencies]
+horizon-mod-api = { path = "../crates/horizon-mod-api" }
+
+[workspace]
