@@ -1,0 +1,7 @@
+id = "openboatutils"
+name = "OpenBoatUtils for Nova"
+description = "Client boat physics controlled by OpenBoatUtils plugin messages."
+version = "0.1.1"
+api = "0.2"
+side = "client"
+capabilities = ["registries"]
