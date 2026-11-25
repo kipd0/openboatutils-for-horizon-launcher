@@ -1,0 +1,384 @@
+# OpenBoatUtils behavioral parity on Horizon and Nova-iOS
+
+Target Minecraft 26.3. Use stable OpenBoatUtils main, protocol 22, unstable=false, as the behavioral reference. The first racing priority is mixed-surface contact. Java substitutes each touching block's friction before the engine averages contacts and classifies the medium. The port changes the average afterward, sometimes using one block at the hull center. Crossing a dirt/ice seam can already change speed and the tick on which the boat leaves land.
+
+This is a source audit and implementation handoff. No Fabric replay, real server exchange, packaged WASM run or physical iOS race was executed during the audit. "Full" below applies only to the named boundary. No end-to-end race has been certified.
+
+## Revisions and source map
+
+O = OpenBoatUtils/OpenBoatUtils 0e17702bb5e2af13cb2a906fd045084c97ef8b1f
+https://github.com/OpenBoatUtils/OpenBoatUtils/tree/0e17702bb5e2af13cb2a906fd045084c97ef8b1f
+P = kipd0/openboatutils-for-horizon-launcher d0e113671a9b1ed446cf987ad9a91277c2bce33a
+https://github.com/kipd0/openboatutils-for-horizon-launcher/tree/d0e113671a9b1ed446cf987ad9a91277c2bce33a
+N = kipd0/nova-ios 3f5aafc3ad7dfb8fb82fd34dfd38f2e7959f9c43
+https://github.com/kipd0/nova-ios/tree/3f5aafc3ad7dfb8fb82fd34dfd38f2e7959f9c43
+B = Nova SDK build pin in P/BUILD.md, 9a73eceb0ef99bf4de15ad4d431c373371112767
+https://github.com/kipd0/nova-ios/tree/9a73eceb0ef99bf4de15ad4d431c373371112767
+H = arismoko/horizon de8b4e2526df9d7f611515b78123a26a3914176f
+https://github.com/arismoko/horizon/tree/de8b4e2526df9d7f611515b78123a26a3914176f
+
+N and H pin vanilla 26.3 in research-lock.json. P's build instructions require a sibling ../crates/horizon-mod-api. Use B by hash; its named newupdate branch did not resolve in the audit. B and N have identical boat directory and controlled-physics declaration at the inspected paths. H is the publicly accessible upstream referenced in engine source. N's README link horizon-rust/horizon did not resolve for anonymous Git access in this audit.
+
+O/settings.gradle, gradle.properties, versions/*/gradle.properties and stonecutter.gradle define six source configurations: 1.21, 1.21.3, 1.21.4, 1.21.5, 1.21.6, 1.21.9. The last declares support through 1.21.11. Use the newest stable conditional implementation for interpolation, rendering, honey and movement where these differ. The original dev revision d51e9a7b987394dc82576eeef667b62fb5186a69 has a 26.2 build and unstable=true. The selected original does not supply a 26.3 oracle. Capture stable Fabric and vanilla 26.3 separately and attribute differences to mod semantics or underlying game version.
+
+Original Java paths in this file are relative to src/main/java/dev/o7moon/openboatutils/. See src/main/resources/fabric.mod.json for entrypoints and openboatutils.mixins.json5 for active mixins and version branches.
+
+- Wire and lifetime: OpenBoatUtils.java (onInitialize, sendVersionPacket, resetAll, getActiveContext, setActiveContext, getStoredContext, dropAllContextStores), client/OpenBoatUtilsClient.java (onInitializeClient), network/{ByteBufChannel,PlayByteBufChannel,ConfigurationByteBufChannel}.java, network/{ServerboundSettingsPacket,ServerboundConfigurationPacket}.java and network/{ClientboundSettingsPacket,ClientboundContextPacket}.java (handlePacket, plus handleContextPacketPayload for settings).
+- Configuration: ISettingContext.java (getVanilla, getVanillaSlipperinessMap), MutableContext.java (applyFrom, breakSlimePlease), StoredContext.java, EntityContext.java, Modes.java (setMode), PerBlockSettingType.java (fromContext), CollisionMode.java, SingleplayerCommands.java (registerCommands).
+- Simulation: mixin/BoatMixin.java (tickHook, paddleHook, hookCheckLocation, oncePerTick, getFriction, openboatutils$getAverageNearbySetting, openboatutils$getMaxNearbySetting, redirectYawVelocityIncrement, pressingForwardHook, pressingBackHook, hookSlipperiness, moveHook, onTick). GetNearbySetting.java, GetStepHeight.java, mixin/BoatAccessor.java expose the shared fields/queries.
+- Collision: mixin/EntityMixin.java (getStepHeight, hookStepHeightOnGroundCheck, hookWalltap, hookStepUp, fixMultipleStep, openboatutils$attemptStep, getDimensions). mixin/HoneyBlockMixin.java (restoreVelocityThreshold, restoreVelocitySet, restoreSlidingThreshold, restoreSlidingVelocityCheck).
+- Presentation/world: mixin/{BoatRendererMixin,BoatRenderStateMixin,PositionInterpolatorAccessor,ClientWorldMixin,ServerPlayNetworkHandlerMixin}.java, ScaledBoatRenderState.java. Inspect preRender/postRender, populateScale, postWorldLoad and the vehicle-movement injection.
+- Port: src/lib.rs (Mod::register, client_packet, client_player_logging_in, client_disconnecting, client_player_clone, controlled_boat_physics, register_client_commands, command, send), src/session.rs (Session::receive, test_profile), src/settings.rs (Settings::packet, mode, apply, needs_block, Ride).
+- Nova engine: crates/horizon-client/src/game/entities/boats/mod.rs (boat_status, boat_ground_friction, tick_boat, paddle_push, tick_boat_paddles, boat_fall), sibling physics.rs (control, vanilla, validate), game/native_hooks/controlled_boat_physics.rs and game/modding/native_surface.rs (boat_friction) under crates/horizon-client/src/. The controlling rider and input latch are in game/network/remote_vehicles.rs.
+- WASM/API: crates/horizon-mod-vocab/src/hooks/{controlled_boat_physics,friction,entity_move,entity_size,client_level_load}.rs and src/host/entities.rs under that crate. Configuration transport is in crates/horizon-client/src/{net.rs,raw_payloads/endpoint.rs,net/configuration_raw_tests.rs}. Compare H and N at the same paths. crates/horizon-mod-wasm/tests/real_member.rs exercises a fixture guest.
+
+## Operation inventory and regression fixtures
+
+IDs below are the signed big-endian short on each channel. Fields after the ID use network byte order. f32/f64 are IEEE binary32/binary64. str is a Minecraft length-prefixed UTF-8 string. A compound body starts with an i32 child count followed by the encoded children in order. The boolean reader treats nonzero as true.
+
+Full = behavior established at the stated boundary. Partial = identifiable working subset. Incorrect = implemented algorithm with a demonstrable counterexample. Missing = effect absent, including decoded/discarded or stored/unused fields. Run each row from a real incoming packet on the packaged guest. Compare state, replies and the consuming tick with the reference.
+
+### openboatutils:settings
+
+S00  RESET  |  Incorrect  |  —
+    Rust deactivates even a compound/named reset. Reset from default, stored and UUID contexts standalone and inside a compound. Only standalone singleton reset disables the selected singleton.
+S01  SET_STEP_HEIGHT  |  Partial  |  f32
+    Height reaches the host but eligibility is decided early and values over 4 revert. Test just below/at/above a lip, with low ceilings, entity obstacles and falling.
+S02  SET_DEFAULT_SLIPPERINESS  |  Incorrect  |  f32
+    Guesses from aggregate drag within f32 EPSILON of 0.6. Give ordinary blocks a new default, straddle ice and compare per-contact sum, medium and result.
+S03  SET_BLOCKS_SLIPPERINESS  |  Incorrect  |  f32,str
+    Center sampling replaces every contact. Negative values act as removal. Set distinct values, cross a seam, test zero, negative and unqualified names.
+S04  SET_BOAT_FALL_DAMAGE  |  Missing  |  bool
+    Flag discarded. Compare fall state, damage and boat survival on solid and water landings with both settings.
+S05  SET_BOAT_WATER_ELEVATION  |  Missing  |  bool
+    Flag discarded. Check submerged elevation, surface contact, Y reset, effective status and repeated location queries on paddle strokes.
+S06  SET_AIR_CONTROL  |  Incorrect  |  bool
+    Sets air drag but keeps air status. Drive off land while steering, paddle in air and enter water. Compare jump eligibility, sounds and water snap.
+S07  SET_BOAT_JUMP_FORCE  |  Partial  |  f32
+    Computes a late additive correction from an earlier Y. Test rest, rising, falling and water entry. Compare pre-float assignment and resulting vy.
+S08  SET_MODE  |  Incorrect  |  i16
+    Preset targets current settings, whereas Java writes singleton. Run all modes in default and named contexts with prior conflicting values.
+S09  SET_GRAVITY  |  Partial  |  f64
+    Wire sign and flowing-water exception are represented. Active default precision and host validation differ. Test signed gravity, no-gravity state, five media and bounds.
+S10  SET_YAW_ACCEL  |  Partial  |  f32
+    Yaw acceleration reaches host with different contact, sign-of-delta and validation paths. Check left/right/both at large f32 yaw velocity and mixed contact.
+S11  SET_FORWARD_ACCEL  |  Partial  |  f32
+    Forward coefficient reaches host. Test distinct mixed contacts, all 16 paddle masks and f32 grouping.
+S12  SET_BACKWARD_ACCEL  |  Partial  |  f32
+    Backward coefficient reaches host. Test mixed contacts, reverse+turn, simultaneous forward/back and host limits.
+S13  SET_TURN_ACCEL  |  Partial  |  f32
+    Turn-only forward coefficient reaches host. Test left/right alone, with brake, with forward+reverse and on seams.
+S14  ALLOW_ACCEL_STACKING  |  Partial  |  bool
+    Adds turn term into a coefficient. Java changes specific paddle field reads. Replay all masks with stacking on/off and nonunit brake.
+S15  RESEND_VERSION  |  Partial  |  —
+    Standalone reply bytes match. Multiple resends collapse to one boolean. Check repeated children, reply order and activation from null.
+S16  SET_UNDERWATER_CONTROL  |  Partial  |  bool
+    Uses water/default drag under water, with limitations at transitions. Test flowing and still immersion with distinct air/water overrides and elevation.
+S17  SET_SURFACE_WATER_CONTROL  |  Partial  |  bool
+    Surface drag works on ordinary ticks. Compare first-entry snap and following surface tick with distinct water/default values.
+S18  SET_EXCLUSIVE_MODE  |  Incorrect  |  i16
+    Exclusive reset targets current settings and mode writes there too. Java resets target then writes preset to singleton. Test dirty default and named objects.
+S19  SET_COYOTE_TIME  |  Partial  |  i32
+    Coyote decrement exists but counters pass through f32 and maxima are absent. Test 0,1,2 ticks, values around 2^24, seam and remount.
+S20  SET_WATER_JUMPING  |  Partial  |  bool
+    Surface recharge exists. Hold and release across surface/underwater/land/air. Compare jump count before effective-medium modification.
+S21  SET_SWIM_FORCE  |  Incorrect  |  f32
+    Adds swim after buoyancy. Java adds before normal float, jump or elevation. Compare simultaneous swim, jump and elevation at nonzero buoyancy.
+S22  REMOVE_BLOCKS_SLIPPERINESS  |  Incorrect  |  str
+    Negative sentinel applied to center block. Remove slime/ice, preserve other entries and cross a mixed hull.
+S23  CLEAR_SLIPPERINESS  |  Incorrect  |  —
+    Clears aggregate lookup instead of per-contact seed. Clear, override one block, reset and compare every mixed-contact mean and medium.
+S24  MODE_SERIES  |  Incorrect  |  i16 count, i16[]
+    Ordered mode handling inherits target/preset differences and rejects some signed counts. Test empty, repeated, reversed, negative and failed last entry.
+S25  EXCLUSIVE_MODE_SERIES  |  Incorrect  |  i16 count, i16[]
+    Exclusive series also clears globals stored in Settings. Test named and default objects, empty series and conflicting modes in reverse order.
+S26  SET_PER_BLOCK  |  Incorrect  |  i16,f32,str
+    Center sampling, unused slots and unchecked index. Exercise all 13 indices, fallback, zero contacts and invalid index, including compound alignment.
+S27  SET_COLLISION_MODE  |  Partial  |  i16
+    Only mode 2 skips entity obstacles. Test five modes against boat, player, filtered/unfiltered mobs, world border and walls.
+S28  SET_STEP_WHILE_FALLING  |  Incorrect  |  bool
+    Sending height still leaves solver ground test in place. Approach lip horizontally while falling without landing that tick.
+S29  SET_INTERPOLATION_COMPAT  |  Missing  |  bool
+    Discarded. Toggle on/off on a remote boat and compare ten-tick interpolation and restoration of constructor duration.
+S30  SET_COLLISION_RESOLUTION  |  Missing  |  i8
+    Discarded. Test signed resolutions 0,1,2,50,51 in corners. Compare submoves and emitted vehicle position.
+S31  ADD_COLLISION_ENTITYTYPE_FILTER  |  Missing  |  str
+    List discarded. Register known/unknown/duplicate entity types and compare modes 3/4.
+S32  CLEAR_COLLISION_ENTITYTYPE_FILTER  |  Missing  |  —
+    No clear effect. Add, clear, switch contexts and retest same entity.
+S33  COMPOUND  |  Incorrect  |  compound body
+    Rust clones and commits atomically with size/depth limits and coalesced replies. Check ordering, repeated replies, trailing data, malformed final child and globals in stored compounds.
+S34  SET_WALLTAP_MULTIPLIER  |  Missing  |  f32
+    Slot 5 written, never used. Hit X, Z, both, and two wall materials. Compare pre-write velocity and rebound.
+S35  SET_JUMPS  |  Partial  |  i32
+    Global converted to f32, no true per-contact maximum, single Ride. Test zero/one/multiple, airborne boat swap and press/release.
+S36  SET_SCALE  |  Missing  |  f32
+    Discarded. Test 0,0.5,1,2 and negative scale for bounds, rider and remote rendering, then restore.
+S37  SET_STEP_UP_SLIPPERINESS  |  Missing  |  f32
+    Slot 8 written, never used. Compare all velocity axes on successful and failed step.
+S38  SET_RESET_ON_WORLD_LOAD  |  Incorrect  |  bool
+    Inverse flag in Settings, reset on clone instead of world construction. Toggle in named context, switch, reset, recreate world, dimension-change and reconnect.
+S39  SET_FIX_DOUBLE_WATER_ELEVATION  |  Missing  |  bool
+    Discarded. Count elevation side effects with tick and paddle-sound lookup in same tick, both flag values.
+S40  SET_LATERAL_SLIPPERINESS  |  Missing  |  f32
+    Slot 9 never used. At oblique yaw verify longitudinal, lateral and vertical components independently.
+S41  SET_BRAKE_SLIPPERINESS  |  Incorrect  |  f32
+    Shared drag damps yaw too and back-key turn gating differs. Brake while turning from nonzero yaw velocity.
+S42  APPLY_IMPULSE  |  Missing  |  3*f64
+    24 bytes discarded. Add two impulses between ticks, unmounted, driving and in second seat.
+S43  APPLY_IMPULSE_RELATIVE  |  Missing  |  3*f64
+    24 bytes discarded. Compare rotated additions at yaw 0,90,180 and oblique, including arrival between ticks.
+S44  SET_MULTI_STEPPING  |  Missing  |  bool
+    Discarded. Cross multi-rise staircase in one tick, then equal-distance candidates and blocked ceiling.
+S45  SET_MAX_SPEED  |  Incorrect  |  f32
+    Uses early rounded speed and clamped drag. Test just below/at/above threshold after lateral grip; check yaw unchanged by resistance.
+S46  SET_MAX_SPEED_RESISTANCE  |  Incorrect  |  f32
+    Folds resistance into drag. Compare negative resistance, negative resulting multiplier and simultaneous brake.
+S47  SET_HONEY_COMPATIBILITY  |  Missing  |  bool
+    Discarded. Test honey side at vy below/equal/above -0.08 and both velocity conversions on newer stable branch.
+
+### openboatutils:context
+
+C00  RESET_CONTEXT  |  Partial  |  —
+    Clears selection. Compare stored contexts, global flags and mounted UUID override after reset.
+C01  SWITCH_CONTEXT  |  Incorrect  |  str
+    Java lazily creates named objects, switches default to reset singleton and ignores other reserved names. Rust snapshots and deactivates default. Test repeated selects, unknown name, default and reserved names.
+C02  DROP_CONTEXT  |  Incorrect  |  str
+    Drop compares selected name instead of effective object identity. Replace a selected store then drop; compare active identity and UUID precedence.
+C03  STORE_CONTEXT  |  Partial  |  str,compound body
+    Stores basic named snapshot. Replace an active store, mutate old selection, reselect and compare. Include mode and global children during store.
+C04  ENTITY_CONTEXT  |  Missing  |  UUID str,compound body
+    No entity store. Set two UUIDs, mount each, switch seats, dismount, render remote boat and recreate world.
+
+### Completion from the inventory
+
+Settings (48): 0 full (0.0%), 15 partial (31.2%), 18 incorrect (37.5%), 15 missing (31.2%).
+Context (5): 0 full (0.0%), 2 partial (40.0%), 2 incorrect (40.0%), 1 missing (20.0%).
+All distinct wire operations (53): 0 full (0.0%), 17 partial (32.1%), 20 incorrect (37.7%), 16 missing (30.2%).
+
+Use the 53 wire operations as the completion denominator. Presets, commands, collision modes, per-block reductions and runtime traces have their own denominators because they exercise many of the same operations. Percentage of fully established wire operations is 0%. This measures parity against the whole contract; the port already has working paths for ordinary inputs.
+
+## Operator command inventory
+
+All 49 original command literals are missing. P supplies the offline-only obutest reset/rally/dirt helpers. O registers server commands, obtains the issuing player, constructs a packet and sends it to that player. For each mapping below check registration and argument tree, a valid call, one invalid call, recipient, wire bytes, return code and resulting state. Include non-player source, case-sensitive Java enum names, comma-list trimming, collision mode range 0–4 and resolution range 1–50. Original context store and UUID operations have no dedicated commands.
+
+/stepsize <size>  ->  S01
+
+/reset  ->  S00
+
+/defaultslipperiness <slipperiness>  ->  S02
+
+/blockslipperiness <slipperiness> <blocks>  ->  S03
+
+/aircontrol <enabled>  ->  S06
+
+/waterelevation <enabled>  ->  S05
+
+/falldamage <enabled>  ->  S04
+
+/jumpforce <force>  ->  S07
+
+/boatmode <mode>  ->  S08
+
+/boatgravity <gravity>  ->  S09
+
+/setyawaccel <accel>  ->  S10
+
+/setforwardaccel <accel>  ->  S11
+
+/setbackwardaccel <accel>  ->  S12
+
+/setturnforwardaccel <accel>  ->  S13
+
+/allowaccelstacking <allow>  ->  S14
+
+/sendversionpacket  ->  S15
+
+/underwatercontrol <enabled>  ->  S16
+
+/surfacewatercontrol <enabled>  ->  S17
+
+/exclusiveboatmode <mode>  ->  S18
+
+/coyotetime <ticks>  ->  S19
+
+/waterjumping <enabled>  ->  S20
+
+/swimforce <force>  ->  S21
+
+/removeblockslipperiness <blocks>  ->  S22
+
+/clearslipperiness  ->  S23
+
+/modeseries <modes>  ->  S24
+
+/exclusivemodeseries <modes>  ->  S25
+
+/setblocksetting <setting> <value> <blocks>  ->  S26
+
+/collisionmode <ID>  ->  S27
+
+/stepwhilefalling <enabled>  ->  S28
+
+/setinterpolationten <enabled>  ->  S29
+
+/setcollisionresolution <resolution>  ->  S30
+
+/clearcollisionfilter  ->  S32
+
+/addcollisionfilter <entitytypes>  ->  S31
+
+/switchcontext <context>  ->  C01
+
+/dropcontext <context>  ->  C02
+
+/setwalltapmultiplier <multiplier>  ->  S34
+
+/setjumps <jumps>  ->  S35
+
+/setscale <scale>  ->  S36
+
+/setstepupslipperiness <slipperiness>  ->  S37
+
+/setresetonworldload <enabled>  ->  S38
+
+/fixdoublewaterelevation <enabled>  ->  S39
+
+/setlateralslipperiness <slipperiness>  ->  S40
+
+/setbrakeslipperiness <brakeslipperiness>  ->  S41
+
+/applyimpulse <x> <y> <z>  ->  S42
+
+/applyimpulserelative <x> <y> <z>  ->  S43
+
+/setmultistepping <enabled>  ->  S44
+
+/setmaxspeed <maxspeed>  ->  S45
+
+/setmaxspeedresistance <resistance>  ->  S46
+
+/sethoneycompat <enabled>  ->  S47
+
+## Preset, block and collision inventories
+
+Modes.setMode always writes the singleton. Each preset changes only the listed fields. The exclusive operations first copy vanilla into their packet target, which can be a different object. For every preset run standalone, additive, exclusive, series, compound and named-target fixtures. Start with conflicting values. Compare complete state in both objects and the subsequent race tick. P recognizes all 25 ordinal values. Zero presets have established race parity.
+
+ID   Name                            Original change and current classification
+00   BROKEN_SLIME_RALLY              08 plus remove explicit slime friction. Partial.
+01   BROKEN_SLIME_RALLY_BLUE         09 plus remove slime. Partial.
+02   BROKEN_SLIME_BA_NOFD            10 plus remove slime. Partial.
+03   BROKEN_SLIME_PARKOUR            11 plus remove slime. Partial.
+04   BROKEN_SLIME_BA_BLUE_NOFD       12 plus remove slime. Partial.
+05   BROKEN_SLIME_PARKOUR_BLUE       13 plus remove slime. Partial.
+06   BROKEN_SLIME_BA                 14 plus remove slime. Partial.
+07   BROKEN_SLIME_BA_BLUE            15 plus remove slime. Partial.
+08   RALLY                           Default friction .98f, no fall damage, air control, step 1.25f. Partial.
+09   RALLY_BLUE                      As 08 with .989f. Partial.
+10   BA_NOFD                         No fall damage, air control, air .98f, step 1.25f, water elevation. Partial.
+11   PARKOUR                         Default .98f, no fall damage, air control, jump .36f, step .5f. Partial.
+12   BA_BLUE_NOFD                    As 10 with air .989f. Partial.
+13   PARKOUR_BLUE                    As 11 with default .989f. Partial.
+14   BA                              Air control, air .98f, step 1.25f, water elevation. Partial.
+15   BA_BLUE                         As 14 with air .989f. Partial.
+16   JUMP_BLOCKS                     Jump on orange/black/green/yellow concrete .36f/0/.5f/.18f. Partial.
+17   BOOSTER_BLOCKS                  Magenta glazed terracotta forward .08f, light gray glazed terracotta yaw .08f. Partial.
+18   DEFAULT_ICE                     Default .98f. Partial.
+19   DEFAULT_NINE_EIGHT_FIVE         Default .985f. Partial.
+20   NOCOL_BOATS_AND_PLAYERS         Collision mode 1. Incorrect: P sets nocollide=false.
+21   NOCOL_ALL_ENTITIES              Collision mode 2. Partial: controlled obstacle path only.
+22   BA_JANKLESS                     14 plus step while falling. Incorrect: solver still uses ground eligibility.
+23   BA_BLUE_JANKLESS                15 plus step while falling. Incorrect: also maps to n=15 and selects .98f.
+24   DEFAULT_BLUE_ICE                Default .989f. Partial.
+
+Broken-slime modes remove a seeded registry entry in O. P encodes the removal with -1 and samples one center block. Rally/parkour and BA modes lose fall or elevation effects where prescribed. Jump/booster entries match on single blocks but use the wrong reduction at seams. Default-friction modes inherit the aggregate replacement error.
+
+PerBlockSettingType ordinal and effective consumer. Test every index with no entry, one entry, two explicit values, an adjacent fallback, an empty hull contact set and a negative value. Preserve exact Java f32 source order. Full per-block consumers: 0/13.
+  0 JUMP_FORCE             Incorrect: center lookup replaces contact mean.
+  1 FORWARDS_ACCEL         Incorrect: center instead of mean.
+  2 BACKWARDS_ACCEL        Incorrect: center instead of mean.
+  3 YAW_ACCEL              Incorrect: center instead of mean.
+  4 TURN_FORWARDS_ACCEL    Incorrect: center instead of mean.
+  5 WALLTAP_MULTIPLIER     Missing: explicit touching vertical face values only.
+  6 JUMPS                  Incorrect: maximum then Java Math.round, with integer global when no override in use.
+  7 COYOTE_TIME            Incorrect: same maximum and integer rule.
+  8 STEP_UP_SLIPPERINESS   Missing: contact mean at a successful step.
+  9 LATERAL_SLIPPERINESS   Missing: contact mean before speed resistance.
+ 10 BRAKE_SLIPPERINESS     Incorrect: shared drag also changes yaw.
+ 11 MAX_SPEED              Incorrect: different reduction, phase and precision.
+ 12 MAX_SPEED_RESISTANCE   Incorrect: different reduction and multiplier clamp.
+
+CollisionMode ordinal and selection behavior:
+  0 VANILLA                         Full at ordinary obstacle-selection boundary.
+  1 NO_BOATS_OR_PLAYERS             Missing.
+  2 NO_ENTITIES                     Partial, controlled swept entity obstacles.
+  3 ENTITYTYPE_FILTER               Missing.
+  4 NO_BOATS_OR_PLAYERS_PLUS_FILTER Missing.
+Test each against a boat, chest boat/raft, player, passenger, filtered and unfiltered mob, block wall and world border. Record obstacle inclusion, resulting collision, push and later entity-contact passes separately.
+
+## Wire behavior and lifetime beyond opcode handling
+
+- Version. Full seven-byte body construction: 00 00 00 00 00 16 00 (short 0, int 22, false). Configuration announcement is partial across targets. O sends on configuration START through openboatutils:configuration. N opens a raw configuration channel with initial bytes. Capture this exchange before play without an offer and after reconfiguration.
+- Play join. Partial. O runs resetAll, selects and initializes singleton, resets interpolation/world flags, and sends version on openboatutils:settings. P creates inactive defaults, sends minecraft:register containing openboatutils:settings NUL openboatutils:context, then version. Capture phase, number/order of advertisements and version, and first-tick context on join.
+- Transaction wrappers. Incorrect. On both channels O recursively handles short 32767 + i32 transaction ID, then echoes those six bytes on the same channel. Inner handlers can return or catch errors before an outer echo. P strips one header and echoes only on success. Test wrapper nesting, same ID on two channels, ignored/unknown and truncated children, and ordering with version replies.
+- Dispatch. Partial. O copies raw bytes and consumes the input buffer, then schedules handlers on the client or server executor. P uses client_packet. Inject multiple changes at a tick boundary; assert order, immediate side effects, response multiplicity and first affected tick. On integrated server O consumes settings VERSION and logs its int; this receiver is missing in P. O declares the configuration version enum but registers no matching configuration server handler in onInitialize.
+- Identity. Global interpolation and reset-on-world-load live outside contexts. Singleton switch always restores vanilla. Switching twice to the same named object leaves it alone. Stored and UUID contexts start as mutable copies of vanilla. Mounted VehicleEntity UUID wins in getActiveContext, including during packet handling. Geometry and rendering additionally try the subject UUID first. Replace a store without replacing an active reference to its old object. Standalone reset, context reset, compound reset and join reset must be tested separately.
+- World. Incorrect. O's ClientWorld constructor clears active selection and both stores when the global flag allows it. P uses dimension_changed at player clone plus login/disconnect clears. Compare a reload within the same dimension, respawn, transfer, disconnect/reconnect and reset-disabled transitions. Java jump counters live on each boat; P keeps only the last active Ride.
+- Decode envelope. P rejects bodies over 65536 bytes, certain names over 256 bytes, more than 32 named stores, a combined block map at 512 entries (also check replacement at capacity), counts over 4096 and depth over 8. Its string length reader stops at three bytes and float readers reject non-finite values. Trailing bytes reject the whole candidate. O uses Identifier.of, UUID.fromString, PacketByteBuf and Java comma splitting; compare unknown/negative IDs, invalid identifiers, empty/trailing elements, non-finite numbers, negative counts, bad children, duplicate block names and partial effects. Record platform bounds as limits of the tested contract.
+
+## Per-tick simulation specification
+
+1. Establish inactive versus active vanilla. Inactive context bypasses most mixins. Vanilla values on activation are fall damage true, default friction .6f, gravity force -0.03999999910593033 (f64), yaw 1f, forward .04f, backward and turn-forward .005f, collision mode vanilla, resolution 1, jumps 1, scale/step-up/lateral/brake 1f, max speed -1f, resistance 0. Jump, step, swim, walltap and coyote are zero. Other optional flags start false. Seed block friction with every registry entry whose value differs from .6f. applyFrom copies explicit settings, in-use flags and filters. Include active vanilla in goldens even when nominal constants look like the host defaults.
+
+2. Evaluate contacts before effective location. Make the slab [minY-.001, minY] using full hull X/Z. Pad floor minima and ceil maxima by one block, traverse X then Z then Y, skip corner columns and the outer top/bottom edge cells. Skip lily pads and require a nonempty voxel-shape intersection. Count each contacting block once. Sum in f32 and divide by the f32 count. Each missing per-block value uses the context fallback; zero contacts use the air override/fallback. Max reductions start at +0f for a nonempty hull, which matters for all-negative overrides. Preserve Java rounding for negative half values and integer behavior at limits. Contact selection tests must include slab/stair boundaries, a six-block ordinary floor, ice/slime seams, negative coordinates, zero effective friction and hull scale changes.
+
+3. On each tick location check reset cached step height. Check active context and that the local player occupies this exact boat. Run oncePerTick using the original medium; the paddle-sound lookup runs no jump-counter update. Held jump adds swim force under still or flowing water. Land or enabled surface water recharges jumps/coyote and clears debounce. Otherwise decrement coyote; on transition to -1 decrement jumps. Key release clears debounce. A valid press assigns vy=jumpForce, marks held, decrements jumps and sets coyote=-1. P uses saturating decrements and a per-current-entity struct. Reference counters are per object. Test ground-held jump consecutive ticks, airborne release/repress, remount, entity ID reuse and passenger seat.
+
+4. Then apply height and effective location. For submerged water elevation, increment stored waterLevel by 1.0, set boat Y to it, zero vy and return surface water. Surface contact can zero vy again. The fix-double flag suppresses these non-tick side effects when enabled. For original air with air control, set nearby friction from air entry/default and report land. Verify paddle sound, submersion, transitions and subsequent ticks. Generic friction, gravity, collision and fall mixins also have call sites outside the locally controlled tick. Include a remote boat and a nearby empty boat in tests.
+
+5. N samples status, ticks submersion, applies fluid interaction, builds coefficients and fires controlled physics. It then either takes the air-to-water snap branch or applies drag to vx/vz and yaw velocity, subtracts gravity from vy and applies positive buoyancy as (vy + buoyancy * (0.04 / 0.65)) * 0.75. Air/surface/flowing baseline drag is .9f, still submerged .45f, land is sampled friction. Flowing-water gravity is 7e-4, still submerged buoyancy is widened .01f. Water-entry snap uses water_level_above minus height in f32, widened plus .101, with an obstruction test. N applies vertical_impulse after this branch. O jump assigns Y and swim adds Y before vanilla float physics. Land jump can coincide algebraically; underwater buoyancy and water entry expose the phase error.
+
+6. At the original updateVelocity setVelocity injection, run lateral grip, max-speed resistance, then brake if back is held. Verify exactly which vanilla branches reach this injection on O. For yaw in radians, d=(-sin(yaw),0,cos(yaw)). Given horizontal v, side=v-d*dot(v,d). Remove side*(1f-lateral) from X/Z. Compute speed=sqrt(vx*vx+vz*vz) in f64, excess=(float)max(0,speed-maxSpeed). If maxSpeed>=0 and excess>0 multiply X/Z by the f32 result 1f-excess*resistance, without a clamp. Brake multiplies X/Z only. P uses hypot on pre-update v, casts to f32 before multiplying drag, clamps resistance and writes shared drag. Keep pre/post values so a small yaw divergence can be assigned to the correct operation.
+
+7. Preserve each paddle operation. O uses sign(proposedYawVelocity-oldYawVelocity)*yawAccel for each yaw write; at high magnitudes an f32 increment can round away. O replaces .04f and both .005f literals at specific positions. Stacking masks the first forward/back reads, while nonunit brake independently masks the first back read. N applies left and right, then turn-only acceleration, then yaw, then forward and reverse. paddle_push uses table-based f32 sine/cosine in f32 radians times f32 acceleration, then widens to f64. In N remote_vehicles the previous tick's four latched bits drive paddles and current jump drives the hook. New directional keys latch after tick_boat. Capture O input timing before adjusting N. Test all 16 masks with/without stacking and braking, single-tick taps and a held jump at different rendering rates.
+
+8. O moveHook uses one ordinary move when resolution is outside 1..50. Otherwise compute subMove=velocity*(1d/resolution) once and use that vector for each move. Collision state evolves between moves. Walltap uses velocity before the colliding write, reflects only zeroed X/Z by -multiplier when positive. With per-wall settings inspect only exactly integer-aligned min/max X/Z faces, using floor(min+1e-5), ceil(max-1e-5), inclusive vertical loop and exclusive horizontal loop bounds. Preserve corner duplicates. Average explicit values in f32; no explicit matches uses global. hookStepUp multiplies all velocity components at the successful-step splice point. Multi-step picks strictly greater horizontal squared distance, offsets the box, gathers new colliders and recurses on blocked remaining movement. Depth limit is 100, remaining horizontal squared threshold 1e-7, corrected Y threshold abs(delta)>1e-7. Compare resolved displacement, velocity, flags and fall state after each move.
+
+9. Packet-time impulses add three f64 values to the occupied boat immediately. For local coordinates and a=radians(-yaw) add (x*cos(a)+z*sin(a), y, -x*sin(a)+z*cos(a)). A scheduled vertical impulse alone loses both X/Z and ordering. Record two impulses and a settings change between consecutive simulation ticks.
+
+10. Geometry/rendering. Entity dimensions scale by abs(scale), with subject UUID first. onTick checks current scale against cached last scale before calculateDimensions; test entity-only changes where effective and subject contexts differ. Renderer uses signed scale, push/pop matrix and for negative scale the newest variant translates by 0.5625*(-scale) before scaling and 0.5625*scale afterward. The older branch has a different post-transform. Confirm interpolator default is restored after forcing 10 ticks (1.21.3 modifies tracked steps, 1.21.5+ captures constructor duration). Honey compatibility on newer stable bypasses both slide conversions and rejects sliding at vy>=-.08. Check active-context effects on other entities touching honey.
+
+11. Integrated movement acceptance. O's ServerPlayNetworkHandlerMixin affects movement validity and vehicle correction thresholds, with an unconditional older threshold change and an active-context condition on 1.21.6+. P is client-side. Run legitimate racing inputs on the integrated server and record corrections for long steps, impulses and split movement. External servers retain authority over corrections. Distinguish client parity, integrated acceptance and server policy in all results.
+
+## Host capabilities and engineering decisions
+
+Friction: N and H call boat_friction for each intersecting block during boat_ground_friction. The scoped friction block-part event carries state, position, entity and kind; replies outside 0..2 revert. P registers no block part. Prove a packaged WASM guest can attach to stock states and access the appropriate session on this loop. Use that path for friction if it passes. For other settings supply ordered hull contacts, using existing geometry, where their reducer actually runs. Center coordinates cannot reconstruct a mixed hull or wall.
+
+Timing: N exposes one controlled phase after medium selection. Its BoatPhysics includes drag, gravity, buoyancy, forward/backward/turn/paddle-turn, vertical impulse, step height and collide_entities. H at the audited pin lacks the controlled hook declaration and call site. H also lacks a configuration_raw declaration under that name in the searched SDK/transport. Current upstream deployment is blocked pending a supported equivalent. Check compiled guest imports, hook IDs and actual dispatch. A supported manifest version alone is insufficient.
+
+Validation: N's physics::validate restores each invalid field independently to vanilla. Drag 0..1, buoyancy and step 0..4, yaw acceleration 0..180, gravity, forward, backward, paddle-turn and vertical impulse -4..4. Friction's independent 0..2 limit does not make all resulting drag values usable. Record/test exact endpoint and just-outside values. If limits remain, publish the compatible numeric domain; unrestricted source parity then remains open.
+
+Shared host extensions: expose original/effective medium and water state at location evaluation, packet-time occupied-vehicle velocity and pre-paddle/post-float velocity editing, ordered contact observations, and optional collision solver inputs/results for candidate identity, substeps, eligibility, step response and wall response. Implement at engine ownership boundaries, with ordinary packets and no-listener vanilla behavior. First test existing APIs for each call site. entity_move is server-side and edits the requested delta. entity_set_velocity is explicitly server-side. Neither implements a client packet-time impulse. Existing entity_size excludes boats/remote copies. Extend dimension refresh and rendering only where missing. client_level_load already exposes the needed new-level event. Configuration-open send needs upstream support or a demonstrated transport equivalent. Use the ordinary command dispatcher in integrated worlds. No source evidence calls for OBU-specific Swift networking, physics or launcher settings.
+
+## Dependency-ordered agent handoff
+
+A. Reference fixtures. Dependencies: none. Own the fixture format and oracle captures. Pin stable Fabric mod/game/build, vanilla 26.3 resources, map, seed, initial state and input clock. Capture disabled, active vanilla, single-op and combined effects. Keep original vs host-vanilla differences explicitly attributed. Deliver inputs, phase-level expected traces and exact rerun commands.
+B. Build and host capability probes. Dependencies: none. Use an isolated SDK checkout at B, place the port beside crates/ per BUILD.md, use specified Rust 1.99.1 with rust-src and wasm32-unknown-unknown, install cargo-horizon-mod, run cargo test --lib, horizon-mod build --wasm and horizon-mod check on the resulting package. Test the same package on N and H. Capture compile/load/dispatch failures, per-contact WASM attachment, world load, configuration-open send and packet arrival. Test no-listener vanilla behavior. Deliver the host matrix and narrow upstream API requirements, with separate authorization needed for changes to another repository.
+C. Protocol, lifetime and state. Depends on A. Own session/settings model, decode, replies and global flags. Distinguish nullable selection, singleton, named object identity and UUID lookup. Pass every wire row at state/byte boundary, including compound side effects, wrapper order, malformed result, store replacement and reload cases.
+D. Presets and commands. Depends on C. Own all 25 deltas and 49 original command mappings. Validate each preset from dirty state, each command's bytes and sender/recipient/result. Run server handler end-to-end with integrated world once B is available. Keep port-only smoke helpers distinguishable.
+E. Hull contacts and reductions. Depends on A/B/C. Own registry seed, per-contact mean/max, air fallback and wall contact samples. Validate raw bits, location and contact order across seams, slopes, stairs, empty hull, lily pads and direction reversals. Deliver shared sampling inputs for F/G.
+F. Race forces and inputs. Depends on A/B/C/E. Own phase ordering, medium, jumps/swim, signed gravity, f32 paddles, lateral/brake/speed and packet-time impulse. Pass pre/post values and all input transitions. Coordinate force and medium phases with H below.
+G. Collision solver. Depends on A/B/E/F. Own five modes, filters, walltap, submoves, step eligibility, step response and multi-step. Pass per-submove position/velocity/flags at walls, corners, staircases, low ceilings, border and entity obstacles. Check secondary contacts.
+H. Water, fall and honey. Depends on C/F/G. Own tick/paddle elevation, duplicate-fix behavior, fall handling and honey conversions. Verify medium, sounds, Y sequence and integrated-server corrections.
+I. Geometry, render and interpolation. Depends on B/C. Coordinate hull size with E/G. Own UUID selection for dimensions/render, cached refresh, signed transforms and ten-tick interpolation. Pass two-boat local/remote fixtures and restoration to vanilla.
+J. Race certification. Depends on A–I. Compare the packaged guest on desktop upstream and physical Nova-iOS. Report each fixture, revision, host capability, first divergence and numeric envelope. A Nova-only trace cannot certify Horizon compatibility. Keep blocked host features visible.
+
+## Acceptance and release evidence
+
+For every wire row, command, preset and host feature, record: revision, fixture ID, status, source symbol, input payload or control sequence, expected output, actual output, first divergence and runtime target. Native mock, WASM fixture, desktop engine, live server and physical device are distinct evidence levels.
+
+Per tick capture index and phase, input sample/latched bits, rider and UUID, effective context identity, original/effective medium, ordered contact positions/states, raw bits of f32 reductions and f64 velocities/positions, yaw/yaw velocity, jump counters, collision flags, bounds, replies and vehicle/paddle packets. Compare discrete values and wire bytes exactly. For specified equivalent operations compare numeric bits. If on-device trig or cross-version vanilla differs, report operation, magnitude and first differing tick. An equal finish time is insufficient to establish equal trajectory.
+
+Required tracks: straight ice acceleration/coast, blue-ice slalom, diagonal mixed surface, brake-turn, walltap corner, descending lip, multi-step stairs, coyote jump, water entry/exit, mid-race change and reconnect. Run local and remote authority, driver/passenger, touch and keyboard, a canceled touch and at least two rendering rates with the same tick-indexed inputs. Keep save/map and starting nonce-independent state identical. Record runtime costs on device alongside correctness.
+
+P's seven existing tests cover a mock play handshake/transaction, next-tick settings/reset, local profiles, named-context store/switch, a simulated ordinary lane, gravity sign and parkour/booster coefficients. They do not perform a packaged race. Some expectations deliberately demonstrate current discrepancies (for example atomic rollback after malformed compound). N's configuration transport and real-member guest tests are evidence at their own boundaries. Promote a feature to full only after its source, consuming phase and required runtime fixtures agree. Record any policy or engine bounds as outstanding compatibility limits.
