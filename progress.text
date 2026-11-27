@@ -1,0 +1,157 @@
+# OpenBoatUtils parity checklist
+
+Target: stable OpenBoatUtils protocol 22 on Minecraft 26.3, on upstream Horizon and Nova-iOS.
+Start with A1 or B1. The letters match the roadmap in plan.text. S00–S47 and C00–C04 refer to its settings and context packet rows. Those rows give the source symbols, edge cases and expected results.
+
+Pick one unchecked line. When its check passes, mark it [x] and append the commit, test name or trace that shows the result. If a host hook is missing, leave the dependent item open and record the host, revision and missing hook beside it. The first race milestone is reproducing the dirt/ice seam in E3.
+
+## A. Get a repeatable reference run
+
+- [ ] A1 Record a short straight-ice run on the pinned stable Fabric build. Save the map, starting pose and tick-indexed inputs.
+- [ ] A2 Replay A1 twice with the mod inactive. Verify identical per-tick positions and yaw.
+- [ ] A3 Replay A1 with an active vanilla context. Save velocity, medium and input bits for comparison.
+- [ ] A4 Run the same inputs on vanilla 26.3. Record the first tick that differs from Fabric, if any.
+
+## B. Build the package and check the hosts (can start alongside A)
+
+- [ ] B1 Follow BUILD.md at the pinned SDK revision. Record the result of each of the seven existing Rust tests.
+- [ ] B2 Build the WASM package and run horizon-mod check. Save the package hash.
+- [ ] B3 Load that package on Nova. Record whether one controlled boat tick reaches the guest.
+- [ ] B4 Repeat B3 on upstream Horizon. Record the first missing import or hook if it fails.
+- [ ] B5 Probe per-block friction on a stock block. Record which contacting blocks reach the WASM guest on each host.
+- [ ] B6 Capture one connection per host. Check configuration-phase version bytes, play advertisement and join version against Fabric.
+- [ ] B7 Trigger a client world load and one incoming play payload. Record callback order relative to the next boat tick.
+
+## C. Match packets and state (use A's references)
+
+- [ ] C1 Distinguish inactive, active vanilla and named settings. Check standalone versus compound reset (S00).
+- [ ] C2 Implement named switch and reset selection (C00–C01). Test default, unknown and reserved names.
+- [ ] C3 Match store replacement and drop (C02–C03). Replace a selected store, mutate the old selection and switch back.
+- [ ] C4 Resolve mounted UUID settings (C04). Switch between two boats and dismount.
+- [ ] C5 Keep world-reset and interpolation flags global (S38, S29). Verify a named-context switch preserves both.
+- [ ] C6 Match world-load and join resets. Compare same-dimension respawn, dimension change and reconnect.
+- [ ] C7 Match compound side effects (S33). Check which earlier writes survive a malformed final child.
+- [ ] C8 Match version resends (S15). Two requests in one compound must yield two replies in order.
+- [ ] C9 Match nested transaction echoes on settings and context. Compare channel, ID and order against captured bytes.
+- [ ] C10 Exercise decoder boundaries from plan.text. Record the first differing state or reply for each unsupported input limit.
+- [ ] C11 Receive a version packet on the integrated server. Verify the reported version against the original receiver.
+
+## D. Restore presets and commands (after C)
+
+- [ ] D1 Fix additive versus exclusive target selection (S08, S18). Test a dirty singleton while a different context is active.
+- [ ] D2 Match ordered mode series (S24–S25). Check empty, repeated and reversed sequences.
+- [ ] D3 Match Rally and Parkour preset fields (8, 9, 11, 13) against reference state snapshots.
+- [ ] D4 Match BA variants (10, 12, 14, 15, 22, 23). Check blue friction and falling-step flags explicitly.
+- [ ] D5 Match the eight legacy presets (0–7). Verify each removes just the seeded slime entry from its base preset.
+- [ ] D6 Match jump and booster block entries (16–17). Verify every block ID, setting index and value.
+- [ ] D7 Match default-friction and collision presets (18–21, 24). Compare state after applying each to conflicting prior settings.
+- [ ] D8 Register /stepsize via the integrated command dispatcher. Verify arguments, return code, recipient and packet bytes.
+
+After D8, each command below is one independent task. Register the literal and pass its valid and invalid argument tests. For a valid call, compare the packet bytes and recipient against the listed operation.
+
+- [ ] /reset (S00)
+- [ ] /defaultslipperiness (S02)
+- [ ] /blockslipperiness (S03)
+- [ ] /aircontrol (S06)
+- [ ] /waterelevation (S05)
+- [ ] /falldamage (S04)
+- [ ] /jumpforce (S07)
+- [ ] /boatmode (S08)
+- [ ] /boatgravity (S09)
+- [ ] /setyawaccel (S10)
+- [ ] /setforwardaccel (S11)
+- [ ] /setbackwardaccel (S12)
+- [ ] /setturnforwardaccel (S13)
+- [ ] /allowaccelstacking (S14)
+- [ ] /sendversionpacket (S15)
+- [ ] /underwatercontrol (S16)
+- [ ] /surfacewatercontrol (S17)
+- [ ] /exclusiveboatmode (S18)
+- [ ] /coyotetime (S19)
+- [ ] /waterjumping (S20)
+- [ ] /swimforce (S21)
+- [ ] /removeblockslipperiness (S22)
+- [ ] /clearslipperiness (S23)
+- [ ] /modeseries (S24)
+- [ ] /exclusivemodeseries (S25)
+- [ ] /setblocksetting (S26)
+- [ ] /collisionmode (S27)
+- [ ] /stepwhilefalling (S28)
+- [ ] /setinterpolationten (S29)
+- [ ] /setcollisionresolution (S30)
+- [ ] /clearcollisionfilter (S32)
+- [ ] /addcollisionfilter (S31)
+- [ ] /switchcontext (C01)
+- [ ] /dropcontext (C02)
+- [ ] /setwalltapmultiplier (S34)
+- [ ] /setjumps (S35)
+- [ ] /setscale (S36)
+- [ ] /setstepupslipperiness (S37)
+- [ ] /setresetonworldload (S38)
+- [ ] /fixdoublewaterelevation (S39)
+- [ ] /setlateralslipperiness (S40)
+- [ ] /setbrakeslipperiness (S41)
+- [ ] /applyimpulse (S42)
+- [ ] /applyimpulserelative (S43)
+- [ ] /setmultistepping (S44)
+- [ ] /setmaxspeed (S45)
+- [ ] /setmaxspeedresistance (S46)
+- [ ] /sethoneycompat (S47)
+
+## E. Fix mixed-surface racing first (after A, B and C)
+
+- [ ] E1 Seed friction from registry defaults (S02–S03). Verify ordinary ground, ice, blue ice and slime before and after reset.
+- [ ] E2 Apply removal and clear per block (S22–S23). Restore one entry after clear and verify its neighbor still uses the default.
+- [ ] E3 Drive diagonally over dirt and ice. Match the ordered hull contacts, f32 mean and land/air decision on every tick.
+- [ ] E4 Repeat contact sampling on a slab edge and a lily pad at negative coordinates. Match the reference contact list.
+- [ ] E5 Match mean reduction and air fallback (S26). Check two distinct contacts, one missing entry and an empty hull.
+- [ ] E6 Match max reduction for jumps and coyote time. Check all-negative overrides and a global integer above 2^24.
+
+## F. Match controls and forces (after E)
+
+- [ ] F1 Match latched direction keys and current jump input. Replay a one-tick tap at two render rates.
+- [ ] F2 Match yaw, forward, reverse and turn-only acceleration (S10–S13). Compare all 16 paddle masks on flat ice.
+- [ ] F3 Match acceleration stacking (S14). Compare f32 push with turn plus reverse, then with braking.
+- [ ] F4 Match air control (S06). Drive off a ledge and compare original/effective medium and paddle sound.
+- [ ] F5 Match signed gravity (S09). Compare Y velocity in air, still water and flowing water, including the default's raw bits.
+- [ ] F6 Match jump assignment and debounce (S07). Compare held versus released/repressed jump on consecutive ticks.
+- [ ] F7 Match per-boat jump and coyote counters (S19, S35). Test leaving a ledge and returning to the same airborne boat.
+- [ ] F8 Match lateral grip (S40). On an oblique drift, compare velocity along and across the boat's heading.
+- [ ] F9 Match speed resistance (S45–S46). Test threshold crossing and a negative resulting multiplier after lateral grip.
+- [ ] F10 Match brake slipperiness (S41). Verify X/Z, yaw velocity and turn-only push while reversing into a turn.
+- [ ] F11 Match packet-time impulses (S42–S43). Send two between ticks and compare XYZ at yaw 0, 90 and an oblique angle.
+
+## G. Match collision outcomes (after E and F)
+
+- [ ] G1 Match collision mode selection (S27). Test vanilla, boat/player exclusion and all-entity exclusion against a wall and a mob.
+- [ ] G2 Match typed filters (S31–S32). Check modes 3 and 4 before and after clearing a filter.
+- [ ] G3 Match ordinary step height and falling eligibility (S01, S28). Compare the same lip grounded and descending.
+- [ ] G4 Match submoves (S30). Compare every resolved displacement for resolutions 1, 2 and 50 at a corner.
+- [ ] G5 Match walltap (S34). Hit an X wall, a Z wall and a two-material corner; compare rebound components.
+- [ ] G6 Match successful-step slipperiness (S37). Verify all three velocity axes on a step and on a failed attempt.
+- [ ] G7 Match multi-stepping (S44). Cross two rises in one tick, then repeat under a low ceiling.
+
+## H. Finish water, fall and honey behavior (after C, F and G)
+
+- [ ] H1 Match surface and underwater drag (S16–S17). Compare the entry tick and next tick in still and flowing water.
+- [ ] H2 Match water jumping and swim (S20–S21). Hold jump through submersion and compare Y before and after buoyancy.
+- [ ] H3 Match elevation and its duplicate-call fix (S05, S39). Count Y changes on a tick with a paddle sound.
+- [ ] H4 Match fall handling (S04). Record fall distance and boat survival on solid ground and in water.
+- [ ] H5 Match honey compatibility (S47). Compare slide behavior just below, at and above vertical speed -0.08.
+- [ ] H6 Replay a large legal step and an impulse on the integrated server. Record any server position correction.
+
+## I. Finish scale and interpolation (after B and C)
+
+- [ ] I1 Match UUID-first collision dimensions (S36). Compare bounds on two boats with different scales, then restore scale 1.
+- [ ] I2 Match signed render scale. Compare negative and zero scale on a remote boat with the Fabric render transform.
+- [ ] I3 Match interpolation (S29). Observe ten ticks after a remote move, disable the option and verify the original duration returns.
+
+## J. Verify the release candidate (after the relevant features pass)
+
+- [ ] J1 Replay straight ice, blue-ice slalom and the mixed-surface seam on packaged desktop Horizon. Save the first differing tick per track.
+- [ ] J2 Replay the brake-turn, walltap corner and descending lip. Compare yaw, velocity and collision flags.
+- [ ] J3 Replay stairs, coyote jump and water entry/exit. Compare each transition tick.
+- [ ] J4 Switch a preset mid-race, then reconnect to a protocol-22 server. Compare replies, state and vehicle packets.
+- [ ] J5 Repeat the race fixtures on physical Nova-iOS using the same inputs. Record device, package hash and frame/tick timing.
+- [ ] J6 Compare driver and passenger, keyboard and touch, canceled touch and two render rates. Check that identical tick inputs yield the expected trajectory.
+- [ ] J7 Reconcile results with the 53 wire rows in plan.text. Report passing fixtures, first divergences and host limits separately for desktop and iOS.
